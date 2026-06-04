@@ -1,0 +1,51 @@
+// Capacitive sensor without any library – manual RC timing
+// Works on ESP32-C3, Uno, Nano, etc.
+
+const int sendPin = 20;    // Generates the charging pulse
+const int recvPin = 0;    // Reads the voltage on the pad (with resistor)
+
+// Settings
+const int samples = 1;   // Number of measurement cycles to average
+const int timeout = 5000; // µs – prevents infinite loop if no touch
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(sendPin, OUTPUT);
+  pinMode(recvPin, INPUT);
+  digitalWrite(sendPin, LOW);   // start with send pin low
+}
+
+
+
+void loop() {
+  
+pinMode(recvPin, OUTPUT);
+digitalWrite(recvPin, LOW);       // discharge
+delayMicroseconds(200);
+
+pinMode(recvPin, INPUT);
+unsigned long start = micros();
+digitalWrite(sendPin, HIGH);      // start charging
+
+while (digitalRead(recvPin) == LOW) {
+  if (micros() - start > timeout) break;
+}
+     // charge time
+digitalWrite(sendPin, LOW);
+
+
+
+
+
+long rawValue = micros() - start;
+
+Serial.print("Raw: ");
+Serial.println(rawValue);
+
+// Example threshold (adjust to your environment)
+if (rawValue > 5) {           // higher value = more capacitance = touch
+  Serial.println(" -> TOUCH");
+}
+
+delay(1);
+}
