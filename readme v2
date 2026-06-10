@@ -1,0 +1,144 @@
+Here is a **concise summary** of the current version of your **dual‑mode BadUSB device** with ESP32‑C3, 80×160 TFT, buttons, and LittleFS script storage.
+
+---
+
+## Project Summary
+
+You have built a **handheld payload injector** that can act as a USB keyboard (wired) or a Bluetooth keyboard (wireless, BLE). Scripts (Ducky Script format) are stored as `.txt` files in the ESP32’s LittleFS file system. A small TFT displays the current script name, counter, and status. Three buttons (Up, Down, Center) let you navigate, execute scripts, and switch between USB/BLE mode.
+
+### Hardware
+| Component | Specification / Pin |
+|-----------|---------------------|
+| MCU | ESP32‑C3 (supports USB and BLE) |
+| Display | 0.96” IPS TFT, 80×160, SPI, landscape rotation (160×80 effective) |
+| Buttons | Up (GPIO0), Down (GPIO1), Center (GPIO2) – active low, internal pull‑ups |
+| Storage | LittleFS partition (scripts in `/data` folder) |
+| Power | USB or battery (deep sleep ~10 µA) |
+
+### Software Features
+- **Dual HID mode** – selectable at runtime (saved in Preferences).  
+  - **USB mode** – uses TinyUSB HID keyboard (wired).  
+  - **BLE mode** – uses BLE HID keyboard (wireless, name “BadUSB Device”).
+- **Script management** – scans LittleFS for all `.txt` files, sorts alphabetically, shows only filename (without extension) on TFT.
+- **Ducky Script parser** – supports: `DELAY`, `STRING`, `ENTER`, `GUI`, `ALT`, `CTRL`, `SHIFT`, `MENU` (case‑insensitive).
+- **Double‑press confirmation** – prevents accidental execution: first Center → `Run?`, second Center within 2s → run.
+- **Mode selection** – long press Center (1s) opens menu → Up/Down toggles USB/BLE → short Center confirms → reboots if changed.
+- **Deep sleep** – after 2 minutes of inactivity.  
+  - USB mode: always allowed.  
+  - BLE mode: only when disconnected.
+- **Wake‑up** – any button press (reboots, restores last script index from RTC memory).
+
+---
+
+## System Flow (Detailed)
+
+```
+Boot / Wake
+    │
+    ├─ Load saved mode (USB/BLE) from Preferences
+    ├─ Init TFT (160×80 landscape), buttons
+    ├─ Mount LittleFS, scan *.txt → script list
+    ├─ Restore last index from RTC
+    └─ Init selected HID (USB or BLE)
+
+        ▼
+    Main Screen (Idle, status "Ready")
+        │
+        ├─ Up/Down      → change script, update display
+        ├─ Short Center → confirm mode (status "Run?", 2s timeout)
+        │       │
+        │       ├─ 2nd Center within 2s → EXECUTE
+        │       │       │
+        │       │       ├─ (BLE) wait for connection if needed
+        │       │       ├─ parse script line by line
+        │       │       ├─ send keystrokes via active HID
+        │       │       ├─ status "Run…" with spinner
+        │       │       └─ finish → "Done!" 1s → back to Idle
+        │       │
+        │       └─ Up/Down or timeout → cancel back to Idle
+        │
+        └─ Long Center (1s) → Mode Selection Menu
+                │
+                ├─ Display: "Select HID Mode:  USB   BLE"
+                ├─ Up/Down toggle highlight
+                ├─ Short Center confirm
+                │       │
+                │       ├─ if mode changed → save, reboot
+                │       └─ if same → back to Idle
+                │
+                └─ (no deep sleep during menu)
+
+    ┌─────────────────────────────────────────────┐
+    │ Deep sleep (idle 2 min)                     │
+    │ - USB mode: always allowed                  │
+    │ - BLE mode: only when disconnected          │
+    │ - Save current index to RTC, turn off TFT   │
+    │ - Wake on any button → reboot               │
+    └─────────────────────────────────────────────┘
+```
+
+---
+
+## Interface (TFT, 160×80 Landscape)
+
+### Main screen (Idle)
+
+```
+┌────────────────────────────────────────────────────┐
+│USB                             [3/5]  Ready        │
+│WiFiGrab                                            │
+└────────────────────────────────────────────────────┘
+```
+
+| Position | Content | Description |
+|----------|---------|-------------|
+| Top‑left | `USB` or `BLE` | Mode indicator. USB = cyan. BLE = green (connected) / red (disconnected). |
+| Top‑right | `[3/5]` | Current script number / total scripts. |
+| Top‑right (after counter) | `Ready` | Status text. Other values: `Run?`, `Run…`, `Done!`, `Err`, `Wait pair` (BLE). |
+| Middle | `WiFiGrab` | Script filename (without `.txt`), truncated to ~12 chars, larger font. |
+
+### Mode selection menu (long press Center)
+
+```
+Select HID Mode:
+  USB   BLE
+Up/Down  Center
+```
+
+- Highlight moves with Up/Down.
+- Short Center confirms.
+
+### No scripts found
+
+```
+No scripts
+```
+
+### Error messages
+
+- `LittleFS mount failed!`  
+- `No BLE conn`  
+- `Can't open file`  
+- `Invalid script`
+
+Errors appear briefly (2s) then return to main screen or sleep.
+
+---
+
+## Summary of User Interactions
+
+| Action | Result |
+|--------|--------|
+| Up / Down | Switch to previous/next script |
+| Short press Center | Enter confirm mode (status `Run?`) |
+| Short press Center again (within 2s) | Execute current script |
+| Up / Down during confirm | Cancel execution |
+| Long press Center (1s) | Enter mode selection menu |
+| In menu: Up/Down | Toggle USB / BLE |
+| In menu: Short Center | Confirm selection (reboot if changed) |
+| No activity for 2 minutes | Deep sleep (if conditions met) |
+| Any button press (while sleeping) | Wake up (reboot) |
+
+---
+
+This is the complete, working dual‑mode BadUSB device. The code is ready to upload, and all features are integrated.
