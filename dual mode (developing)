@@ -1,0 +1,485 @@
+/*
+  BadUSB Payload Launcher - Dual Mode (BLE + USB HID)
+  - For ESP32-C3: BLE only (USB HID not supported on C3)
+  - For ESP32-S3: Both BLE and USB HID work
+  - Physical buttons: Up (GPIO0), Down (GPIO1), Center (GPIO2)
+  - TFT: 80x160 ST7735
+  - Scripts from LittleFS
+*/
+
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+#include <FS.h>
+#include <LittleFS.h>
+#include <esp_sleep.h>
+#include <Preferences.h>
+
+// ========== Select HID Mode ==========
+// Uncomment ONLY ONE of these:
+#define USE_BLE_MODE      // BLE mode (works on ESP32-C3)
+// #define USE_USB_MODE   // USB mode (only works on ESP32-S3)
+
+#ifdef USE_BLE_MODE
+  #include <BleKeyboard.h>
+  BleKeyboard bleKeyboard("BadUSB Device", "Espressif", 100);
+#endif
+
+#ifdef USE_USB_MODE
+  #include <USB.h>
+  #include <USBHIDKeyboard.h>
+  USBHIDKeyboard Keyboard;
+#endif
+
+// ========== Button Pins ==========
+#define BTN_UP      0
+#define BTN_DOWN    1
+#define BTN_CENTER  2
+
+// ========== TFT Display ==========
+TFT_eSPI tft = TFT_eSPI();
+#define SCREEN_W 160
+#define SCREEN_H 80
+
+// ========== Script Management ==========
+const int MAX_SCRIPTS = 30;
+String scriptNames[MAX_SCRIPTS];
+int scriptCount = 0;
+int currentIndex = 0;
+RTC_DATA_ATTR int savedIndex = 0;
+
+// ========== UI States ==========
+enum UIMode { MODE_IDLE, MODE_CONFIRM, MODE_RUNNING };
+UIMode uiMode = MODE_IDLE;
+unsigned long confirmStartTime = 0;
+const unsigned long CONFIRM_TIMEOUT = 2000;
+unsigned long lastActivity = 0;
+const unsigned long SLEEP_TIMEOUT = 120000; // 2 minutes
+
+const char spinnerChars[] = {'|', '/', '-', '\\'};
+int spinnerIndex = 0;
+unsigned long lastSpinnerUpdate = 0;
+const unsigned long SPINNER_INTERVAL = 150;
+
+// ========== Function Prototypes ==========
+void setupTFT();
+void scanScripts();
+void refreshDisplay();
+void updateStatusText(const char* status);
+void showError(const char* msg);
+void executeScript(int index);
+void parseAndRunLine(String line);
+void goToDeepSleep();
+void wakeUpReason();
+bool isHIDConnected();
+
+// ========== Setup ==========
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("BadUSB Device Starting...");
+
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_CENTER, INPUT_PULLUP);
+
+  wakeUpReason();
+  setupTFT();
+
+  if (!LittleFS.begin(false)) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setCursor(0, 30);
+    tft.setTextColor(TFT_RED);
+    tft.println("LittleFS mount failed!");
+    delay(5000);
+    goToDeepSleep();
+    return;
+  }
+
+  scanScripts();
+  if (scriptCount == 0) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setCursor(10, 30);
+    tft.println("No scripts");
+  } else {
+    if (savedIndex >= 0 && savedIndex < scriptCount) currentIndex = savedIndex;
+    else currentIndex = 0;
+    refreshDisplay();
+  }
+
+  // Initialize HID mode
+  #ifdef USE_BLE_MODE
+    bleKeyboard.begin();
+    Serial.println("BLE Keyboard started. Pair with 'BadUSB Device'");
+  #endif
+
+  #ifdef USE_USB_MODE
+    USB.begin();
+    Keyboard.begin();
+    Serial.println("USB HID Keyboard started.");
+  #endif
+
+  lastActivity = millis();
+}
+
+void loop() {
+  // Update connection status on TFT
+  static unsigned long lastStatusUpdate = 0;
+  if (millis() - lastStatusUpdate > 1000) {
+    lastStatusUpdate = millis();
+    static bool lastConnected = false;
+    bool nowConnected = isHIDConnected();
+    if (nowConnected != lastConnected) {
+      lastConnected = nowConnected;
+      tft.fillRect(0, 0, 30, 10, TFT_BLACK);
+      tft.setCursor(2, 2);
+      if (nowConnected) tft.setTextColor(TFT_GREEN);
+      else tft.setTextColor(TFT_RED);
+      #ifdef USE_BLE_MODE
+        tft.print("BLE");
+      #else
+        tft.print("USB");
+      #endif
+      tft.setTextColor(TFT_WHITE);
+    }
+  }
+
+  // Debounced button reading
+  static unsigned long lastDebounceTime = 0;
+  static bool lastUpState = HIGH, lastDownState = HIGH, lastCenterState = HIGH;
+  bool upPressed = false, downPressed = false, centerPressed = false;
+
+  bool upNow = digitalRead(BTN_UP);
+  bool downNow = digitalRead(BTN_DOWN);
+  bool centerNow = digitalRead(BTN_CENTER);
+
+  if (upNow != lastUpState) lastDebounceTime = millis();
+  if ((millis() - lastDebounceTime) > 50 && upNow != lastUpState) {
+    lastUpState = upNow;
+    if (lastUpState == LOW) upPressed = true;
+  }
+  if (downNow != lastDownState) lastDebounceTime = millis();
+  if ((millis() - lastDebounceTime) > 50 && downNow != lastDownState) {
+    lastDownState = downNow;
+    if (lastDownState == LOW) downPressed = true;
+  }
+  if (centerNow != lastCenterState) lastDebounceTime = millis();
+  if ((millis() - lastDebounceTime) > 50 && centerNow != lastCenterState) {
+    lastCenterState = centerNow;
+    if (lastCenterState == LOW) centerPressed = true;
+  }
+
+  // Update activity timer
+  if ((upPressed || downPressed || centerPressed) && uiMode != MODE_RUNNING) {
+    lastActivity = millis();
+  }
+
+  // UI state machine
+  switch (uiMode) {
+    case MODE_IDLE:
+      if (upPressed && scriptCount > 0) {
+        currentIndex = (currentIndex - 1 + scriptCount) % scriptCount;
+        refreshDisplay();
+      }
+      if (downPressed && scriptCount > 0) {
+        currentIndex = (currentIndex + 1) % scriptCount;
+        refreshDisplay();
+      }
+      if (centerPressed && scriptCount > 0) {
+        uiMode = MODE_CONFIRM;
+        confirmStartTime = millis();
+        updateStatusText("Run?");
+      }
+      break;
+
+    case MODE_CONFIRM:
+      if (millis() - confirmStartTime > CONFIRM_TIMEOUT) {
+        uiMode = MODE_IDLE;
+        refreshDisplay();
+        break;
+      }
+      if (upPressed || downPressed) {
+        uiMode = MODE_IDLE;
+        refreshDisplay();
+      }
+      if (centerPressed) {
+        uiMode = MODE_RUNNING;
+        updateStatusText("Run…");
+        executeScript(currentIndex);
+        uiMode = MODE_IDLE;
+        refreshDisplay();
+        lastActivity = millis();
+      }
+      break;
+
+    case MODE_RUNNING:
+      if (millis() - lastSpinnerUpdate > SPINNER_INTERVAL) {
+        lastSpinnerUpdate = millis();
+        spinnerIndex = (spinnerIndex + 1) % 4;
+        char status[10];
+        sprintf(status, "Run… %c", spinnerChars[spinnerIndex]);
+        updateStatusText(status);
+      }
+      break;
+  }
+
+  // Deep sleep conditions
+  bool allowSleep = false;
+  #ifdef USE_BLE_MODE
+    allowSleep = (uiMode == MODE_IDLE && !bleKeyboard.isConnected() && (millis() - lastActivity > SLEEP_TIMEOUT));
+  #endif
+  #ifdef USE_USB_MODE
+    allowSleep = (uiMode == MODE_IDLE && (millis() - lastActivity > SLEEP_TIMEOUT));
+  #endif
+
+  if (allowSleep) {
+    goToDeepSleep();
+  }
+
+  delay(10);
+}
+
+// ========== Helper: Check HID Connection Status ==========
+bool isHIDConnected() {
+  #ifdef USE_BLE_MODE
+    return bleKeyboard.isConnected();
+  #endif
+  #ifdef USE_USB_MODE
+    // USB is always connected when plugged in
+    return true;
+  #endif
+  return false;
+}
+
+// ========== Display Functions ==========
+void setupTFT() {
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+}
+
+void refreshDisplay() {
+  if (scriptCount == 0) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setCursor(10, 35);
+    tft.print("No scripts");
+    return;
+  }
+  tft.fillScreen(TFT_BLACK);
+  // Mode indicator (top‑left)
+  tft.setCursor(2, 2);
+  tft.setTextSize(1);
+  if (isHIDConnected()) tft.setTextColor(TFT_GREEN);
+  else tft.setTextColor(TFT_RED);
+  #ifdef USE_BLE_MODE
+    tft.print("BLE");
+  #else
+    tft.print("USB");
+  #endif
+  tft.setTextColor(TFT_WHITE);
+
+  // Script name
+  String name = scriptNames[currentIndex];
+  if (name.length() > 13) name = name.substring(0,12) + "…";
+  tft.setCursor(0, 30);
+  tft.setTextSize(2);
+  tft.print(name);
+
+  // Counter [x/y]
+  tft.setTextSize(1);
+  char counter[20];
+  sprintf(counter, "[%d/%d]", currentIndex+1, scriptCount);
+  int cw = tft.textWidth(counter);
+  tft.setCursor(SCREEN_W - cw - 50, 30);
+  tft.print(counter);
+
+  // Status
+  const char* statusText = (uiMode == MODE_IDLE) ? "Ready" : (uiMode == MODE_CONFIRM) ? "Run?" : "Run…";
+  int sw = tft.textWidth(statusText);
+  tft.setCursor(SCREEN_W - sw - 5, 30);
+  tft.print(statusText);
+}
+
+void updateStatusText(const char* status) {
+  tft.fillRect(SCREEN_W - 60, 30, 60, 16, TFT_BLACK);
+  tft.setCursor(SCREEN_W - tft.textWidth(status) - 5, 30);
+  tft.print(status);
+}
+
+void showError(const char* msg) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 35);
+  tft.setTextColor(TFT_RED);
+  tft.print(msg);
+  delay(2000);
+  refreshDisplay();
+  tft.setTextColor(TFT_WHITE);
+}
+
+// ========== Script Management ==========
+void scanScripts() {
+  scriptCount = 0;
+  File root = LittleFS.open("/");
+  if (!root) return;
+  File file = root.openNextFile();
+  while (file && scriptCount < MAX_SCRIPTS) {
+    String fname = file.name();
+    if (fname.endsWith(".txt")) {
+      fname = fname.substring(0, fname.length()-4);
+      scriptNames[scriptCount++] = fname;
+    }
+    file = root.openNextFile();
+  }
+  for (int i=0; i<scriptCount-1; i++)
+    for (int j=i+1; j<scriptCount; j++)
+      if (scriptNames[i] > scriptNames[j]) {
+        String t = scriptNames[i];
+        scriptNames[i] = scriptNames[j];
+        scriptNames[j] = t;
+      }
+}
+
+// ========== Script Execution ==========
+void executeScript(int idx) {
+  if (idx < 0 || idx >= scriptCount) {
+    showError("Invalid script");
+    return;
+  }
+  String path = "/" + scriptNames[idx] + ".txt";
+  File scriptFile = LittleFS.open(path, "r");
+  if (!scriptFile) {
+    showError("Can't open file");
+    return;
+  }
+
+  // Wait for connection if in BLE mode
+  #ifdef USE_BLE_MODE
+    if (!bleKeyboard.isConnected()) {
+      updateStatusText("Wait pair");
+      unsigned long startWait = millis();
+      while (!bleKeyboard.isConnected() && millis() - startWait < 10000) {
+        delay(100);
+      }
+      if (!bleKeyboard.isConnected()) {
+        showError("No BLE conn");
+        return;
+      }
+    }
+  #endif
+
+  while (scriptFile.available()) {
+    String line = scriptFile.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0 || line.startsWith("//")) continue;
+    parseAndRunLine(line);
+    delay(1);
+  }
+  scriptFile.close();
+  updateStatusText("Done!");
+  delay(1000);
+}
+
+void parseAndRunLine(String line) {
+  line.toUpperCase();
+  int spaceIdx = line.indexOf(' ');
+  String cmd = (spaceIdx == -1) ? line : line.substring(0, spaceIdx);
+  String arg = (spaceIdx == -1) ? "" : line.substring(spaceIdx+1);
+  arg.trim();
+
+  if (cmd == "DELAY") {
+    unsigned long ms = arg.toInt();
+    unsigned long start = millis();
+    while (millis() - start < ms) delay(10);
+  } 
+  else if (cmd == "STRING") {
+    #ifdef USE_BLE_MODE
+      bleKeyboard.print(arg);
+    #endif
+    #ifdef USE_USB_MODE
+      Keyboard.print(arg);
+    #endif
+  } 
+  else if (cmd == "ENTER") {
+    #ifdef USE_BLE_MODE
+      bleKeyboard.write(KEY_RETURN);
+    #endif
+    #ifdef USE_USB_MODE
+      Keyboard.write(KEY_RETURN);
+    #endif
+  } 
+  else if (cmd == "GUI") {
+    #ifdef USE_BLE_MODE
+      bleKeyboard.press(KEY_LEFT_GUI);
+      bleKeyboard.releaseAll();
+    #endif
+    #ifdef USE_USB_MODE
+      Keyboard.press(KEY_LEFT_GUI);
+      Keyboard.releaseAll();
+    #endif
+  } 
+  else if (cmd == "ALT") {
+    #ifdef USE_BLE_MODE
+      bleKeyboard.press(KEY_LEFT_ALT);
+      bleKeyboard.releaseAll();
+    #endif
+    #ifdef USE_USB_MODE
+      Keyboard.press(KEY_LEFT_ALT);
+      Keyboard.releaseAll();
+    #endif
+  } 
+  else if (cmd == "CTRL") {
+    #ifdef USE_BLE_MODE
+      bleKeyboard.press(KEY_LEFT_CTRL);
+      bleKeyboard.releaseAll();
+    #endif
+    #ifdef USE_USB_MODE
+      Keyboard.press(KEY_LEFT_CTRL);
+      Keyboard.releaseAll();
+    #endif
+  } 
+  else if (cmd == "SHIFT") {
+    #ifdef USE_BLE_MODE
+      bleKeyboard.press(KEY_LEFT_SHIFT);
+      bleKeyboard.releaseAll();
+    #endif
+    #ifdef USE_USB_MODE
+      Keyboard.press(KEY_LEFT_SHIFT);
+      Keyboard.releaseAll();
+    #endif
+  } 
+  else if (cmd == "MENU") {
+    #ifdef USE_BLE_MODE
+      bleKeyboard.press(KEY_RIGHT_GUI);
+      bleKeyboard.releaseAll();
+    #endif
+    #ifdef USE_USB_MODE
+      Keyboard.press(KEY_RIGHT_GUI);
+      Keyboard.releaseAll();
+    #endif
+  } 
+  else {
+    Serial.printf("Unknown command: %s\n", cmd.c_str());
+  }
+  delay(20);
+}
+
+// ========== Deep Sleep ==========
+void goToDeepSleep() {
+  Serial.println("Entering deep sleep...");
+  savedIndex = currentIndex;
+  tft.writecommand(TFT_DISPOFF);
+  delay(10);
+  const uint64_t wakeupPins = (1ULL << BTN_UP) | (1ULL << BTN_DOWN) | (1ULL << BTN_CENTER);
+  esp_deep_sleep_enable_gpio_wakeup(wakeupPins, ESP_GPIO_WAKEUP_GPIO_LOW);
+  esp_deep_sleep_start();
+}
+
+void wakeUpReason() {
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  if (cause == ESP_SLEEP_WAKEUP_GPIO) {
+    Serial.println("Wake from deep sleep by button");
+  } else {
+    Serial.println("Normal boot");
+  }
+}
